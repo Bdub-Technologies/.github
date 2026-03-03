@@ -34,10 +34,23 @@ on:
         description: 'Slack channel ID'
         required: true
         type: string
+    secrets:
+      JIRA_API_TOKEN:
+        description: 'JIRA API token with permissions to manage releases'
+        required: true
+      JIRA_EMAIL:
+        description: 'Email associated with JIRA API token'
+        required: true
+      SLACK_BOT_TOKEN:
+        description: 'Slack bot token with permissions to post messages'
+        required: true
+
+permissions: {}
 
 jobs:
   update-jira:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Get current month
         id: month
@@ -50,6 +63,7 @@ jobs:
           JIRA_BASE_URL: ${{ inputs.jira_base_url }}
           JIRA_PROJECT_KEY: ${{ inputs.jira_project_key }}
         run: |
+          set -euo pipefail
           RELEASE_NAME="${{ inputs.environment }} - ${{ steps.month.outputs.month }}"
           TIMESTAMP=$(date +'%Y-%m-%d %H:%M')
           SERVICE="${{ inputs.service }}"
@@ -58,7 +72,7 @@ jobs:
           echo "Looking for release: $RELEASE_NAME"
 
           # Get all versions for the project
-          VERSIONS_RESPONSE=$(curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+          VERSIONS_RESPONSE=$(curl -fsS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
             -H "Accept: application/json" \
             "$JIRA_BASE_URL/rest/api/3/project/$JIRA_PROJECT_KEY/versions")
 
@@ -68,13 +82,13 @@ jobs:
             echo "Release not found, creating new release: $RELEASE_NAME"
 
             # Get project ID first
-            PROJECT_RESPONSE=$(curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            PROJECT_RESPONSE=$(curl -fsS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
               -H "Accept: application/json" \
               "$JIRA_BASE_URL/rest/api/3/project/$JIRA_PROJECT_KEY")
 
             PROJECT_ID=$(echo "$PROJECT_RESPONSE" | jq -r '.id')
 
-            CREATE_RESPONSE=$(curl -s -X POST \
+            CREATE_RESPONSE=$(curl -fsS -X POST \
               -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
               -H "Content-Type: application/json" \
               -H "Accept: application/json" \
@@ -91,23 +105,43 @@ jobs:
             echo "Found existing release with ID: $RELEASE_ID"
 
             # Get current description
-            VERSION_RESPONSE=$(curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            VERSION_RESPONSE=$(curl -fsS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
               -H "Accept: application/json" \
               "$JIRA_BASE_URL/rest/api/3/version/$RELEASE_ID")
 
             CURRENT_DESC=$(echo "$VERSION_RESPONSE" | jq -r '.description // ""')
 
-            # Check if service already exists in table
-            if echo "$CURRENT_DESC" | grep -q "| $SERVICE |"; then
-              # Update existing service line
-              NEW_DESC=$(echo "$CURRENT_DESC" | sed "s/| $SERVICE | [^|]* | [^|]* |/| $SERVICE | $VERSION | $TIMESTAMP |/")
+            if [ -z "$CURRENT_DESC" ]; then
+              NEW_DESC=$(printf '%s\n\n| Service | Version | Deployed |\n|---------|---------|----------|\n| %s | %s | %s |' \
+                "## Current Versions" \
+                "$SERVICE" \
+                "$VERSION" \
+                "$TIMESTAMP")
             else
-              # Add new service line
-              NEW_DESC=$(printf "%s\n| %s | %s | %s |" "$CURRENT_DESC" "$SERVICE" "$VERSION" "$TIMESTAMP")
+              # Update service row by exact service column match; append row if missing.
+              NEW_DESC=$(printf '%s\n' "$CURRENT_DESC" | awk -F'|' -v svc="$SERVICE" -v ver="$VERSION" -v ts="$TIMESTAMP" '
+                BEGIN { updated=0 }
+                {
+                  if ($0 ~ /^\|/) {
+                    service=$2
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", service)
+                    if (service == svc) {
+                      print "| " svc " | " ver " | " ts " |"
+                      updated=1
+                      next
+                    }
+                  }
+                  print
+                }
+                END {
+                  if (!updated) {
+                    print "| " svc " | " ver " | " ts " |"
+                  }
+                }')
             fi
 
             # Update release description
-            curl -s -X PUT \
+            curl -fsS -X PUT \
               -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
               -H "Content-Type: application/json" \
               -H "Accept: application/json" \
@@ -119,15 +153,21 @@ jobs:
 
   notify-slack:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: update-jira
+    if: always()
     steps:
       - name: Extract JIRA ticket from changelog
         id: ticket
+        env:
+          CHANGELOG: ${{ inputs.changelog }}
         run: |
-          CHANGELOG='${{ inputs.changelog }}'
-          TICKET=$(echo "$CHANGELOG" | grep -oE 'BDUB-[0-9]+' | head -1 || echo "")
+          set -euo pipefail
+          TICKET=$(printf '%s\n' "$CHANGELOG" | grep -oE 'BDUB-[0-9]+' | head -1 || true)
           echo "ticket=$TICKET" >> $GITHUB_OUTPUT
 
-      - name: Post to Slack
+      - name: Post to Slack (Success)
+        if: needs.update-jira.result == 'success'
         uses: slackapi/slack-github-action@v1.26.0
         with:
           slack-bot-token: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -140,6 +180,25 @@ jobs:
                   "text": {
                     "type": "mrkdwn",
                     "text": ":white_check_mark: *Deploy: ${{ inputs.service }}* v${{ inputs.version }} → *${{ inputs.environment }}*\n\nTicket: ${{ steps.ticket.outputs.ticket || 'N/A' }}"
+                  }
+                }
+              ]
+            }
+
+      - name: Post to Slack (Failure)
+        if: needs.update-jira.result != 'success'
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          slack-bot-token: ${{ secrets.SLACK_BOT_TOKEN }}
+          channel-id: ${{ inputs.slack_channel_id }}
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: *Deploy notify issue: ${{ inputs.service }}* v${{ inputs.version }} → *${{ inputs.environment }}*\n\nJIRA update job result: `${{ needs.update-jira.result }}`\nTicket: ${{ steps.ticket.outputs.ticket || 'N/A' }}"
                   }
                 }
               ]
