@@ -1,0 +1,134 @@
+name: Post-Deploy Notify
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: 'Service name (e.g., bw-dating-chat)'
+        required: true
+        type: string
+      version:
+        description: 'Version being deployed (e.g., 1.2.3)'
+        required: true
+        type: string
+      environment:
+        description: 'Environment (dev or prod)'
+        required: true
+        type: string
+      changelog:
+        description: 'Changelog/release notes (optional)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  update-jira:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get current month
+        id: month
+        run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
+
+      - name: Update JIRA Release
+        env:
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_PROJECT_KEY: ${{ vars.JIRA_PROJECT_KEY }}
+        run: |
+          RELEASE_NAME="${{ inputs.environment }} - ${{ steps.month.outputs.month }}"
+          TIMESTAMP=$(date +'%Y-%m-%d %H:%M')
+          SERVICE="${{ inputs.service }}"
+          VERSION="${{ inputs.version }}"
+
+          echo "Looking for release: $RELEASE_NAME"
+
+          # Get all versions for the project
+          VERSIONS_RESPONSE=$(curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            -H "Accept: application/json" \
+            "$JIRA_BASE_URL/rest/api/3/project/$JIRA_PROJECT_KEY/versions")
+
+          RELEASE_ID=$(echo "$VERSIONS_RESPONSE" | jq -r ".[] | select(.name == \"$RELEASE_NAME\") | .id")
+
+          if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" == "null" ]; then
+            echo "Release not found, creating new release: $RELEASE_NAME"
+
+            # Get project ID first
+            PROJECT_RESPONSE=$(curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+              -H "Accept: application/json" \
+              "$JIRA_BASE_URL/rest/api/3/project/$JIRA_PROJECT_KEY")
+
+            PROJECT_ID=$(echo "$PROJECT_RESPONSE" | jq -r '.id')
+
+            CREATE_RESPONSE=$(curl -s -X POST \
+              -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              "$JIRA_BASE_URL/rest/api/3/version" \
+              -d "{
+                \"name\": \"$RELEASE_NAME\",
+                \"projectId\": $PROJECT_ID,
+                \"description\": \"## Current Versions\\n\\n| Service | Version | Deployed |\\n|---------|---------|----------|\\n| $SERVICE | $VERSION | $TIMESTAMP |\"
+              }")
+
+            RELEASE_ID=$(echo "$CREATE_RESPONSE" | jq -r '.id')
+            echo "Created release with ID: $RELEASE_ID"
+          else
+            echo "Found existing release with ID: $RELEASE_ID"
+
+            # Get current description
+            VERSION_RESPONSE=$(curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+              -H "Accept: application/json" \
+              "$JIRA_BASE_URL/rest/api/3/version/$RELEASE_ID")
+
+            CURRENT_DESC=$(echo "$VERSION_RESPONSE" | jq -r '.description // ""')
+
+            # Check if service already exists in table
+            if echo "$CURRENT_DESC" | grep -q "| $SERVICE |"; then
+              # Update existing service line
+              NEW_DESC=$(echo "$CURRENT_DESC" | sed "s/| $SERVICE | [^|]* | [^|]* |/| $SERVICE | $VERSION | $TIMESTAMP |/")
+            else
+              # Add new service line
+              NEW_DESC="$CURRENT_DESC
+| $SERVICE | $VERSION | $TIMESTAMP |"
+            fi
+
+            # Update release description
+            curl -s -X PUT \
+              -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              "$JIRA_BASE_URL/rest/api/3/version/$RELEASE_ID" \
+              -d "{\"description\": $(echo "$NEW_DESC" | jq -Rs .)}"
+
+            echo "Updated release description"
+          fi
+
+  notify-slack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract JIRA ticket from changelog
+        id: ticket
+        run: |
+          CHANGELOG='${{ inputs.changelog }}'
+          TICKET=$(echo "$CHANGELOG" | grep -oE 'BDUB-[0-9]+' | head -1 || echo "")
+          echo "ticket=$TICKET" >> $GITHUB_OUTPUT
+
+      - name: Post to Slack
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ vars.SLACK_CHANNEL_ID }}
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: *Deploy: ${{ inputs.service }}* v${{ inputs.version }} → *${{ inputs.environment }}*\n\nTicket: ${{ steps.ticket.outputs.ticket || 'N/A' }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
