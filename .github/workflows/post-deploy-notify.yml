@@ -89,8 +89,7 @@ jobs:
               NEW_DESC=$(echo "$CURRENT_DESC" | sed "s/| $SERVICE | [^|]* | [^|]* |/| $SERVICE | $VERSION | $TIMESTAMP |/")
             else
               # Add new service line
-              NEW_DESC="$CURRENT_DESC
-| $SERVICE | $VERSION | $TIMESTAMP |"
+              NEW_DESC=$(printf "%s\n| %s | %s | %s |" "$CURRENT_DESC" "$SERVICE" "$VERSION" "$TIMESTAMP")
             fi
 
             # Update release description
