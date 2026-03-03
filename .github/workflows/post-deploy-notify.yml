@@ -68,31 +68,60 @@ jobs:
           TIMESTAMP=$(date +'%Y-%m-%d %H:%M')
           SERVICE="${{ inputs.service }}"
           VERSION="${{ inputs.version }}"
+          API_BASE="/rest/api/3"
+
+          jira_get() {
+            local path="$1"
+            local body
+            local status
+            body=$(mktemp)
+            status=$(curl -sS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+              -H "Accept: application/json" \
+              -o "$body" \
+              -w "%{http_code}" \
+              "$JIRA_BASE_URL$path")
+
+            if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+              cat "$body"
+              rm -f "$body"
+              return 0
+            fi
+
+            echo "JIRA GET failed: $path (HTTP $status)" >&2
+            head -c 500 "$body" >&2 || true
+            echo >&2
+            rm -f "$body"
+            return 1
+          }
 
           echo "Looking for release: $RELEASE_NAME"
 
-          # Get all versions for the project
-          VERSIONS_RESPONSE=$(curl -fsS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
-            -H "Accept: application/json" \
-            "$JIRA_BASE_URL/rest/api/3/project/$JIRA_PROJECT_KEY/versions")
+          # Resolve project first; fallback to v2 API if needed.
+          if ! PROJECT_RESPONSE=$(jira_get "$API_BASE/project/$JIRA_PROJECT_KEY"); then
+            echo "Retrying JIRA project lookup with v2 API..." >&2
+            API_BASE="/rest/api/2"
+            PROJECT_RESPONSE=$(jira_get "$API_BASE/project/$JIRA_PROJECT_KEY")
+          fi
+
+          PROJECT_ID=$(echo "$PROJECT_RESPONSE" | jq -r '.id // empty')
+          if [ -z "$PROJECT_ID" ]; then
+            echo "Unable to resolve JIRA project id for key: $JIRA_PROJECT_KEY" >&2
+            exit 1
+          fi
+
+          # Get all versions for the project.
+          VERSIONS_RESPONSE=$(jira_get "$API_BASE/project/$JIRA_PROJECT_KEY/versions")
 
           RELEASE_ID=$(echo "$VERSIONS_RESPONSE" | jq -r ".[] | select(.name == \"$RELEASE_NAME\") | .id")
 
           if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" == "null" ]; then
             echo "Release not found, creating new release: $RELEASE_NAME"
 
-            # Get project ID first
-            PROJECT_RESPONSE=$(curl -fsS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
-              -H "Accept: application/json" \
-              "$JIRA_BASE_URL/rest/api/3/project/$JIRA_PROJECT_KEY")
-
-            PROJECT_ID=$(echo "$PROJECT_RESPONSE" | jq -r '.id')
-
             CREATE_RESPONSE=$(curl -fsS -X POST \
               -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
               -H "Content-Type: application/json" \
               -H "Accept: application/json" \
-              "$JIRA_BASE_URL/rest/api/3/version" \
+              "$JIRA_BASE_URL$API_BASE/version" \
               -d "{
                 \"name\": \"$RELEASE_NAME\",
                 \"projectId\": $PROJECT_ID,
@@ -105,9 +134,7 @@ jobs:
             echo "Found existing release with ID: $RELEASE_ID"
 
             # Get current description
-            VERSION_RESPONSE=$(curl -fsS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
-              -H "Accept: application/json" \
-              "$JIRA_BASE_URL/rest/api/3/version/$RELEASE_ID")
+            VERSION_RESPONSE=$(jira_get "$API_BASE/version/$RELEASE_ID")
 
             CURRENT_DESC=$(echo "$VERSION_RESPONSE" | jq -r '.description // ""')
 
@@ -145,7 +172,7 @@ jobs:
               -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
               -H "Content-Type: application/json" \
               -H "Accept: application/json" \
-              "$JIRA_BASE_URL/rest/api/3/version/$RELEASE_ID" \
+              "$JIRA_BASE_URL$API_BASE/version/$RELEASE_ID" \
               -d "{\"description\": $(echo "$NEW_DESC" | jq -Rs .)}"
 
             echo "Updated release description"
@@ -170,7 +197,6 @@ jobs:
         if: needs.update-jira.result == 'success'
         uses: slackapi/slack-github-action@v1.26.0
         with:
-          slack-bot-token: ${{ secrets.SLACK_BOT_TOKEN }}
           channel-id: ${{ inputs.slack_channel_id }}
           payload: |
             {
@@ -184,12 +210,13 @@ jobs:
                 }
               ]
             }
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
 
       - name: Post to Slack (Failure)
         if: needs.update-jira.result != 'success'
         uses: slackapi/slack-github-action@v1.26.0
         with:
-          slack-bot-token: ${{ secrets.SLACK_BOT_TOKEN }}
           channel-id: ${{ inputs.slack_channel_id }}
           payload: |
             {
@@ -203,3 +230,5 @@ jobs:
                 }
               ]
             }
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
