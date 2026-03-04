@@ -310,7 +310,8 @@ jobs:
           fi
 
           if [ -n "${CHANGELOG:-}" ]; then
-            ISSUE_KEYS=$(printf '%s\n' "$CHANGELOG" | grep -oE "${JIRA_PROJECT_KEY}-[0-9]+" | sort -u | tr '\n' ' ')
+            ISSUE_KEYS=$(printf '%s\n' "$CHANGELOG" | grep -oE "${JIRA_PROJECT_KEY}-[0-9]+" || true)
+            ISSUE_KEYS=$(printf '%s\n' "$ISSUE_KEYS" | sed '/^$/d' | sort -u | tr '\n' ' ')
             if [ -n "$ISSUE_KEYS" ]; then
               if [ -z "${RELEASE_ID:-}" ] || [ "$RELEASE_ID" = "null" ]; then
                 echo "WARNING: Cannot link issues because release ID is unavailable." >&2
