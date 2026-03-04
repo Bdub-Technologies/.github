@@ -60,9 +60,7 @@ on:
         description: 'Slack bot token with permissions to post messages'
         required: true
 
-permissions:
-  contents: read
-  pull-requests: read
+permissions: {}
 
 jobs:
   update-jira:
