@@ -266,8 +266,13 @@ jobs:
                 "$VERSION" \
                 "$TIMESTAMP")
             else
+              NORMALIZED_DESC=$(printf '%s\n' "$CURRENT_DESC" | sed -E \
+                -e 's/^##[[:space:]]+Current Versions$/h3. Current Versions/' \
+                -e 's/^\|[[:space:]]*Service[[:space:]]*\|[[:space:]]*Version[[:space:]]*\|[[:space:]]*Deployed[[:space:]]*\|$/|| Service || Version || Deployed ||/' \
+                -e '/^\|[-[:space:]]+\|[-[:space:]]+\|[-[:space:]]+\|$/d')
+
               # Update service row by exact service column match; append row if missing.
-              NEW_DESC=$(printf '%s\n' "$CURRENT_DESC" | awk -F'|' -v svc="$SERVICE" -v ver="$VERSION" -v ts="$TIMESTAMP" '
+              NEW_DESC=$(printf '%s\n' "$NORMALIZED_DESC" | awk -F'|' -v svc="$SERVICE" -v ver="$VERSION" -v ts="$TIMESTAMP" '
                 BEGIN { updated=0 }
                 {
                   if ($0 ~ /^\|/) {
