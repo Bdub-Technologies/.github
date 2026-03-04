@@ -100,6 +100,11 @@ jobs:
             local release_name="$2"
 
             echo "$payload" | jq -r --arg name "$release_name" '
+              def norm:
+                tostring
+                | gsub("^[[:space:]]+|[[:space:]]+$"; "")
+                | ascii_downcase;
+
               first(
                 (
                   if type == "array" then .[]
@@ -107,7 +112,7 @@ jobs:
                   else empty
                   end
                 )
-                | select(.name == $name)
+                | select((.name | norm) == ($name | norm))
                 | .id
               ) // empty
             '
