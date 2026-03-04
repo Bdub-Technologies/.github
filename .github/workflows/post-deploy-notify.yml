@@ -30,6 +30,11 @@ on:
         required: false
         type: string
         default: ''
+      deployment_url:
+        description: 'GitHub Actions deployment run URL (legacy, optional)'
+        required: false
+        type: string
+        default: ''
       jira_base_url:
         description: 'JIRA base URL'
         required: false
