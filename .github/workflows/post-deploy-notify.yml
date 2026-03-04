@@ -25,8 +25,8 @@ on:
         required: false
         type: string
         default: ''
-      deployment_url:
-        description: 'GitHub Actions deployment run URL (optional)'
+      release_pr_url:
+        description: 'GitHub release PR URL (optional)'
         required: false
         type: string
         default: ''
@@ -55,7 +55,9 @@ on:
         description: 'Slack bot token with permissions to post messages'
         required: true
 
-permissions: {}
+permissions:
+  contents: read
+  pull-requests: read
 
 jobs:
   update-jira:
@@ -74,7 +76,7 @@ jobs:
           JIRA_PROJECT_KEY: ${{ inputs.jira_project_key }}
           CHANGELOG: ${{ inputs.changelog }}
           RELEASE_URL: ${{ inputs.release_url }}
-          DEPLOYMENT_URL: ${{ inputs.deployment_url }}
+          RELEASE_PR_URL: ${{ inputs.release_pr_url }}
         run: |
           set -euo pipefail
           RELEASE_NAME="${{ inputs.environment }} - ${{ steps.month.outputs.month }}"
@@ -265,6 +267,68 @@ jobs:
             rm -f "$create_file"
           }
 
+          github_api_get() {
+            local path="$1"
+            local body
+            local status
+
+            body=$(mktemp)
+            status=$(curl -sS -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -o "$body" \
+              -w "%{http_code}" \
+              "https://api.github.com$path")
+
+            if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+              cat "$body"
+              rm -f "$body"
+              return 0
+            fi
+
+            rm -f "$body"
+            return 1
+          }
+
+          github_find_release_pr_url() {
+            local tag_name="$1"
+            local ref_response
+            local object_sha
+            local object_type
+            local commit_sha
+            local tag_object
+            local pulls_response
+            local pr_url
+
+            if ! ref_response=$(github_api_get "/repos/$GITHUB_REPOSITORY/git/ref/tags/$tag_name"); then
+              echo ""
+              return 0
+            fi
+
+            object_sha=$(echo "$ref_response" | jq -r '.object.sha // empty')
+            object_type=$(echo "$ref_response" | jq -r '.object.type // empty')
+            commit_sha="$object_sha"
+
+            if [ "$object_type" = "tag" ]; then
+              if tag_object=$(github_api_get "/repos/$GITHUB_REPOSITORY/git/tags/$object_sha"); then
+                commit_sha=$(echo "$tag_object" | jq -r '.object.sha // empty')
+              fi
+            fi
+
+            if [ -z "$commit_sha" ]; then
+              echo ""
+              return 0
+            fi
+
+            if ! pulls_response=$(github_api_get "/repos/$GITHUB_REPOSITORY/commits/$commit_sha/pulls"); then
+              echo ""
+              return 0
+            fi
+
+            pr_url=$(echo "$pulls_response" | jq -r 'map(select(.merged_at != null)) | first | .html_url // empty')
+            echo "$pr_url"
+          }
+
           echo "Looking for release: $RELEASE_NAME"
 
           # Resolve project first; fallback to v2 API if needed.
@@ -334,11 +398,11 @@ jobs:
           if [ -n "${RELEASE_ID:-}" ] && [ "$RELEASE_ID" != "null" ]; then
             jira_clear_release_description
 
-            if [ -z "${DEPLOYMENT_URL:-}" ]; then
-              DEPLOYMENT_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            if [ -z "${RELEASE_PR_URL:-}" ]; then
+              RELEASE_PR_URL=$(github_find_release_pr_url "v${VERSION}")
             fi
 
-            jira_add_related_work_link "Deployment run: ${SERVICE} ${VERSION} (${RELEASE_NAME})" "$DEPLOYMENT_URL"
+            jira_add_related_work_link "Release PR: ${SERVICE} v${VERSION}" "${RELEASE_PR_URL:-}"
             jira_add_related_work_link "Release: ${SERVICE} v${VERSION}" "${RELEASE_URL:-}"
           fi
 
