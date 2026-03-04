@@ -116,8 +116,11 @@ jobs:
             local release_name="$1"
             local versions_response
             local release_id
-            local query
-            local search_response
+            local page_response
+            local start_at=0
+            local max_results=100
+            local is_last="false"
+            local values_count
 
             versions_response=$(jira_get "$API_BASE/project/$JIRA_PROJECT_KEY/versions")
             release_id=$(jira_extract_release_id "$versions_response" "$release_name")
@@ -126,9 +129,25 @@ jobs:
               return 0
             fi
 
-            query=$(jq -rn --arg v "$release_name" '$v | @uri')
-            search_response=$(jira_get "$API_BASE/project/$JIRA_PROJECT_KEY/version?query=$query&maxResults=100")
-            jira_extract_release_id "$search_response" "$release_name"
+            while [ "$is_last" != "true" ]; do
+              page_response=$(jira_get "$API_BASE/project/$JIRA_PROJECT_KEY/version?startAt=$start_at&maxResults=$max_results")
+              release_id=$(jira_extract_release_id "$page_response" "$release_name")
+              if [ -n "$release_id" ]; then
+                echo "$release_id"
+                return 0
+              fi
+
+              is_last=$(echo "$page_response" | jq -r '.isLast // "false"')
+              values_count=$(echo "$page_response" | jq -r '(.values // []) | length')
+
+              if [ "$values_count" = "0" ]; then
+                break
+              fi
+
+              start_at=$((start_at + max_results))
+            done
+
+            echo ""
           }
 
           echo "Looking for release: $RELEASE_NAME"
