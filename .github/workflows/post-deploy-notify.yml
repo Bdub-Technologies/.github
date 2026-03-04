@@ -94,6 +94,43 @@ jobs:
             return 1
           }
 
+          jira_extract_release_id() {
+            local payload="$1"
+            local release_name="$2"
+
+            echo "$payload" | jq -r --arg name "$release_name" '
+              first(
+                (
+                  if type == "array" then .[]
+                  elif (type == "object" and has("values")) then .values[]
+                  else empty
+                  end
+                )
+                | select(.name == $name)
+                | .id
+              ) // empty
+            '
+          }
+
+          jira_find_release_id() {
+            local release_name="$1"
+            local versions_response
+            local release_id
+            local query
+            local search_response
+
+            versions_response=$(jira_get "$API_BASE/project/$JIRA_PROJECT_KEY/versions")
+            release_id=$(jira_extract_release_id "$versions_response" "$release_name")
+            if [ -n "$release_id" ]; then
+              echo "$release_id"
+              return 0
+            fi
+
+            query=$(jq -rn --arg v "$release_name" '$v | @uri')
+            search_response=$(jira_get "$API_BASE/project/$JIRA_PROJECT_KEY/version?query=$query&maxResults=100")
+            jira_extract_release_id "$search_response" "$release_name"
+          }
+
           echo "Looking for release: $RELEASE_NAME"
 
           # Resolve project first; fallback to v2 API if needed.
@@ -109,10 +146,7 @@ jobs:
             exit 1
           fi
 
-          # Get all versions for the project.
-          VERSIONS_RESPONSE=$(jira_get "$API_BASE/project/$JIRA_PROJECT_KEY/versions")
-
-          RELEASE_ID=$(echo "$VERSIONS_RESPONSE" | jq -r ".[] | select(.name == \"$RELEASE_NAME\") | .id")
+          RELEASE_ID=$(jira_find_release_id "$RELEASE_NAME")
 
           if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" == "null" ]; then
             echo "Release not found, creating new release: $RELEASE_NAME"
@@ -132,17 +166,31 @@ jobs:
 
             echo "DEBUG: HTTP $HTTP_CODE"
             if [ "$HTTP_CODE" != "201" ]; then
-              echo "ERROR: Failed to create JIRA release (HTTP $HTTP_CODE)"
-              echo "Response: $(cat "$RESPONSE_FILE")"
+              CREATE_RESPONSE=$(cat "$RESPONSE_FILE")
+
+              if [ "$HTTP_CODE" = "400" ] && echo "$CREATE_RESPONSE" | jq -e '.errors.name? | test("already exists"; "i")' >/dev/null; then
+                RELEASE_ID=$(jira_find_release_id "$RELEASE_NAME")
+                if [ -n "$RELEASE_ID" ]; then
+                  echo "Release already exists, using existing release ID: $RELEASE_ID"
+                  rm -f "$RESPONSE_FILE"
+                else
+                  echo "ERROR: Release already exists but could not be located: $RELEASE_NAME" >&2
+                  echo "Response: $CREATE_RESPONSE" >&2
+                  rm -f "$RESPONSE_FILE"
+                  exit 1
+                fi
+              else
+                echo "ERROR: Failed to create JIRA release (HTTP $HTTP_CODE)"
+                echo "Response: $CREATE_RESPONSE"
+                rm -f "$RESPONSE_FILE"
+                exit 1
+              fi
+            else
+              CREATE_RESPONSE=$(cat "$RESPONSE_FILE")
+              RELEASE_ID=$(echo "$CREATE_RESPONSE" | jq -r '.id')
+              echo "Created release with ID: $RELEASE_ID"
               rm -f "$RESPONSE_FILE"
-              exit 1
             fi
-
-            CREATE_RESPONSE=$(cat "$RESPONSE_FILE")
-            rm -f "$RESPONSE_FILE"
-
-            RELEASE_ID=$(echo "$CREATE_RESPONSE" | jq -r '.id')
-            echo "Created release with ID: $RELEASE_ID"
           else
             echo "Found existing release with ID: $RELEASE_ID"
 
