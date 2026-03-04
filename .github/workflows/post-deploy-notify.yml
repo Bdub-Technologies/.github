@@ -20,6 +20,16 @@ on:
         required: false
         type: string
         default: ''
+      release_url:
+        description: 'GitHub release URL (optional)'
+        required: false
+        type: string
+        default: ''
+      deployment_url:
+        description: 'GitHub Actions deployment run URL (optional)'
+        required: false
+        type: string
+        default: ''
       jira_base_url:
         description: 'JIRA base URL'
         required: false
@@ -63,6 +73,8 @@ jobs:
           JIRA_BASE_URL: ${{ inputs.jira_base_url }}
           JIRA_PROJECT_KEY: ${{ inputs.jira_project_key }}
           CHANGELOG: ${{ inputs.changelog }}
+          RELEASE_URL: ${{ inputs.release_url }}
+          DEPLOYMENT_URL: ${{ inputs.deployment_url }}
         run: |
           set -euo pipefail
           RELEASE_NAME="${{ inputs.environment }} - ${{ steps.month.outputs.month }}"
@@ -190,6 +202,69 @@ jobs:
             rm -f "$update_file"
           }
 
+          jira_clear_release_description() {
+            local clear_file
+            local clear_http
+
+            clear_file=$(mktemp)
+            clear_http=$(curl -sS -w "%{http_code}" -o "$clear_file" -X PUT \
+              -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              "$JIRA_BASE_URL$API_BASE/version/$RELEASE_ID" \
+              -d "{\"description\":\"\"}")
+
+            if [ "$clear_http" = "200" ]; then
+              echo "Cleared Jira release description"
+            else
+              echo "WARNING: Failed to clear Jira release description (HTTP $clear_http)" >&2
+              echo "Response: $(cat "$clear_file")" >&2
+            fi
+
+            rm -f "$clear_file"
+          }
+
+          jira_add_related_work_link() {
+            local title="$1"
+            local url="$2"
+            local related_response
+            local exists
+            local create_file
+            local create_http
+
+            if [ -z "$url" ]; then
+              return 0
+            fi
+
+            if ! related_response=$(jira_get "$API_BASE/version/$RELEASE_ID/relatedwork"); then
+              echo "WARNING: Unable to read Jira related work list" >&2
+              return 0
+            fi
+
+            exists=$(echo "$related_response" | jq -r --arg u "$url" 'if type == "array" then any(.[]?; .url == $u) else false end')
+            if [ "$exists" = "true" ]; then
+              echo "Related work already exists: $url"
+              return 0
+            fi
+
+            create_file=$(mktemp)
+            create_http=$(curl -sS -w "%{http_code}" -o "$create_file" -X POST \
+              -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              "$JIRA_BASE_URL$API_BASE/version/$RELEASE_ID/relatedwork" \
+              -d "{\"category\":\"External Link\",\"title\":$(printf '%s' "$title" | jq -Rs .),\"url\":$(printf '%s' "$url" | jq -Rs .)}")
+
+            if [ "$create_http" = "201" ] || [ "$create_http" = "200" ]; then
+              echo "Added related work link: $title"
+            else
+              echo "WARNING: Failed to add related work link '$title' (HTTP $create_http)" >&2
+              echo "Response: $(cat "$create_file")" >&2
+            fi
+
+            rm -f "$create_file"
+          }
+
           echo "Looking for release: $RELEASE_NAME"
 
           # Resolve project first; fallback to v2 API if needed.
@@ -219,8 +294,7 @@ jobs:
               "$JIRA_BASE_URL$API_BASE/version" \
               -d "{
                 \"name\": \"$RELEASE_NAME\",
-                \"projectId\": $PROJECT_ID,
-                \"description\": \"h3. Current Versions\\n\\n|| Service || Version || Deployed ||\\n| $SERVICE | $VERSION | $TIMESTAMP |\"
+                \"projectId\": $PROJECT_ID
               }")
 
             echo "DEBUG: HTTP $HTTP_CODE"
@@ -253,65 +327,19 @@ jobs:
             fi
           elif [ "$SKIP_DESCRIPTION_UPDATE" != "true" ]; then
             echo "Found existing release with ID: $RELEASE_ID"
-
-            # Get current description
-            VERSION_RESPONSE=$(jira_get "$API_BASE/version/$RELEASE_ID")
-
-            CURRENT_DESC=$(echo "$VERSION_RESPONSE" | jq -r '.description // ""')
-
-            if [ -z "$CURRENT_DESC" ]; then
-              NEW_DESC=$(printf '%s\n\n|| Service || Version || Deployed ||\n| %s | %s | %s |' \
-                "h3. Current Versions" \
-                "$SERVICE" \
-                "$VERSION" \
-                "$TIMESTAMP")
-            else
-              NORMALIZED_DESC=$(printf '%s\n' "$CURRENT_DESC" | sed -E \
-                -e 's/^##[[:space:]]+Current Versions$/h3. Current Versions/' \
-                -e 's/^\|[[:space:]]*Service[[:space:]]*\|[[:space:]]*Version[[:space:]]*\|[[:space:]]*Deployed[[:space:]]*\|$/|| Service || Version || Deployed ||/' \
-                -e '/^\|[-[:space:]]+\|[-[:space:]]+\|[-[:space:]]+\|$/d')
-
-              # Update service row by exact service column match; append row if missing.
-              NEW_DESC=$(printf '%s\n' "$NORMALIZED_DESC" | awk -F'|' -v svc="$SERVICE" -v ver="$VERSION" -v ts="$TIMESTAMP" '
-                BEGIN { updated=0 }
-                {
-                  if ($0 ~ /^\|/) {
-                    service=$2
-                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", service)
-                    if (service == svc) {
-                      print "| " svc " | " ver " | " ts " |"
-                      updated=1
-                      next
-                    }
-                  }
-                  print
-                }
-                END {
-                  if (!updated) {
-                    print "| " svc " | " ver " | " ts " |"
-                  }
-                }')
-            fi
-
-            # Update release description
-            UPDATE_FILE=$(mktemp)
-            UPDATE_HTTP=$(curl -sS -w "%{http_code}" -o "$UPDATE_FILE" -X PUT \
-              -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
-              -H "Content-Type: application/json" \
-              -H "Accept: application/json" \
-              "$JIRA_BASE_URL$API_BASE/version/$RELEASE_ID" \
-              -d "{\"description\": $(echo "$NEW_DESC" | jq -Rs .)}")
-
-            echo "DEBUG: Update HTTP $UPDATE_HTTP"
-            if [ "$UPDATE_HTTP" != "200" ]; then
-              echo "ERROR: Failed to update release (HTTP $UPDATE_HTTP)"
-              echo "Response: $(cat "$UPDATE_FILE")"
-            else
-              echo "Updated release description"
-            fi
-            rm -f "$UPDATE_FILE"
           else
             echo "Skipping JIRA release update because existing release ID could not be resolved."
+          fi
+
+          if [ -n "${RELEASE_ID:-}" ] && [ "$RELEASE_ID" != "null" ]; then
+            jira_clear_release_description
+
+            if [ -z "${DEPLOYMENT_URL:-}" ]; then
+              DEPLOYMENT_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            fi
+
+            jira_add_related_work_link "Deployment run: ${SERVICE} ${VERSION} (${RELEASE_NAME})" "$DEPLOYMENT_URL"
+            jira_add_related_work_link "Release: ${SERVICE} v${VERSION}" "${RELEASE_URL:-}"
           fi
 
           if [ -n "${CHANGELOG:-}" ]; then
