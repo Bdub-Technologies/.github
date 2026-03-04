@@ -116,8 +116,10 @@ jobs:
 
           if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" == "null" ]; then
             echo "Release not found, creating new release: $RELEASE_NAME"
+            echo "DEBUG: projectId=$PROJECT_ID, service=$SERVICE, version=$VERSION"
 
-            CREATE_RESPONSE=$(curl -fsS -X POST \
+            RESPONSE_FILE=$(mktemp)
+            HTTP_CODE=$(curl -sS -w "%{http_code}" -o "$RESPONSE_FILE" -X POST \
               -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
               -H "Content-Type: application/json" \
               -H "Accept: application/json" \
@@ -127,6 +129,17 @@ jobs:
                 \"projectId\": $PROJECT_ID,
                 \"description\": \"## Current Versions\\n\\n| Service | Version | Deployed |\\n|---------|---------|----------|\\n| $SERVICE | $VERSION | $TIMESTAMP |\"
               }")
+
+            echo "DEBUG: HTTP $HTTP_CODE"
+            if [ "$HTTP_CODE" != "201" ]; then
+              echo "ERROR: Failed to create JIRA release (HTTP $HTTP_CODE)"
+              echo "Response: $(cat "$RESPONSE_FILE")"
+              rm -f "$RESPONSE_FILE"
+              exit 1
+            fi
+
+            CREATE_RESPONSE=$(cat "$RESPONSE_FILE")
+            rm -f "$RESPONSE_FILE"
 
             RELEASE_ID=$(echo "$CREATE_RESPONSE" | jq -r '.id')
             echo "Created release with ID: $RELEASE_ID"
@@ -168,14 +181,22 @@ jobs:
             fi
 
             # Update release description
-            curl -fsS -X PUT \
+            UPDATE_FILE=$(mktemp)
+            UPDATE_HTTP=$(curl -sS -w "%{http_code}" -o "$UPDATE_FILE" -X PUT \
               -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
               -H "Content-Type: application/json" \
               -H "Accept: application/json" \
               "$JIRA_BASE_URL$API_BASE/version/$RELEASE_ID" \
-              -d "{\"description\": $(echo "$NEW_DESC" | jq -Rs .)}"
+              -d "{\"description\": $(echo "$NEW_DESC" | jq -Rs .)}")
 
-            echo "Updated release description"
+            echo "DEBUG: Update HTTP $UPDATE_HTTP"
+            if [ "$UPDATE_HTTP" != "200" ]; then
+              echo "ERROR: Failed to update release (HTTP $UPDATE_HTTP)"
+              echo "Response: $(cat "$UPDATE_FILE")"
+            else
+              echo "Updated release description"
+            fi
+            rm -f "$UPDATE_FILE"
           fi
 
   notify-slack:
