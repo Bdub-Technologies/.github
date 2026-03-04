@@ -62,6 +62,7 @@ jobs:
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_BASE_URL: ${{ inputs.jira_base_url }}
           JIRA_PROJECT_KEY: ${{ inputs.jira_project_key }}
+          CHANGELOG: ${{ inputs.changelog }}
         run: |
           set -euo pipefail
           RELEASE_NAME="${{ inputs.environment }} - ${{ steps.month.outputs.month }}"
@@ -156,6 +157,39 @@ jobs:
             echo ""
           }
 
+          jira_add_fix_version_to_issue() {
+            local issue_key="$1"
+            local issue_response
+            local has_fix_version
+            local update_file
+            local update_http
+
+            issue_response=$(jira_get "$API_BASE/issue/$issue_key?fields=fixVersions")
+            has_fix_version=$(echo "$issue_response" | jq -r --arg rid "$RELEASE_ID" '[.fields.fixVersions[]?.id == $rid] | any')
+
+            if [ "$has_fix_version" = "true" ]; then
+              echo "Issue already linked to release: $issue_key"
+              return 0
+            fi
+
+            update_file=$(mktemp)
+            update_http=$(curl -sS -w "%{http_code}" -o "$update_file" -X PUT \
+              -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              "$JIRA_BASE_URL$API_BASE/issue/$issue_key" \
+              -d "{\"update\":{\"fixVersions\":[{\"add\":{\"id\":\"$RELEASE_ID\"}}]}}")
+
+            if [ "$update_http" = "204" ]; then
+              echo "Linked issue to release: $issue_key"
+            else
+              echo "WARNING: Failed to link issue $issue_key to release (HTTP $update_http)" >&2
+              echo "Response: $(cat "$update_file")" >&2
+            fi
+
+            rm -f "$update_file"
+          }
+
           echo "Looking for release: $RELEASE_NAME"
 
           # Resolve project first; fallback to v2 API if needed.
@@ -186,7 +220,7 @@ jobs:
               -d "{
                 \"name\": \"$RELEASE_NAME\",
                 \"projectId\": $PROJECT_ID,
-                \"description\": \"## Current Versions\\n\\n| Service | Version | Deployed |\\n|---------|---------|----------|\\n| $SERVICE | $VERSION | $TIMESTAMP |\"
+                \"description\": \"h3. Current Versions\\n\\n|| Service || Version || Deployed ||\\n| $SERVICE | $VERSION | $TIMESTAMP |\"
               }")
 
             echo "DEBUG: HTTP $HTTP_CODE"
@@ -226,8 +260,8 @@ jobs:
             CURRENT_DESC=$(echo "$VERSION_RESPONSE" | jq -r '.description // ""')
 
             if [ -z "$CURRENT_DESC" ]; then
-              NEW_DESC=$(printf '%s\n\n| Service | Version | Deployed |\n|---------|---------|----------|\n| %s | %s | %s |' \
-                "## Current Versions" \
+              NEW_DESC=$(printf '%s\n\n|| Service || Version || Deployed ||\n| %s | %s | %s |' \
+                "h3. Current Versions" \
                 "$SERVICE" \
                 "$VERSION" \
                 "$TIMESTAMP")
@@ -273,6 +307,24 @@ jobs:
             rm -f "$UPDATE_FILE"
           else
             echo "Skipping JIRA release update because existing release ID could not be resolved."
+          fi
+
+          if [ -n "${CHANGELOG:-}" ]; then
+            ISSUE_KEYS=$(printf '%s\n' "$CHANGELOG" | grep -oE "${JIRA_PROJECT_KEY}-[0-9]+" | sort -u | tr '\n' ' ')
+            if [ -n "$ISSUE_KEYS" ]; then
+              if [ -z "${RELEASE_ID:-}" ] || [ "$RELEASE_ID" = "null" ]; then
+                echo "WARNING: Cannot link issues because release ID is unavailable." >&2
+              else
+                echo "Linking issues to release $RELEASE_ID: $ISSUE_KEYS"
+                for ISSUE_KEY in $ISSUE_KEYS; do
+                  jira_add_fix_version_to_issue "$ISSUE_KEY"
+                done
+              fi
+            else
+              echo "No JIRA issue keys found in changelog"
+            fi
+          else
+            echo "No changelog provided; skipping issue-to-release linking"
           fi
 
   notify-slack:
