@@ -64,7 +64,7 @@ permissions: {}
 
 jobs:
   update-jira:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 15
     steps:
       - name: Get current month
@@ -434,7 +434,7 @@ jobs:
           fi
 
   notify-slack:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 10
     needs: update-jira
     if: always()
